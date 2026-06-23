@@ -1,0 +1,66 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const http = require('http');
+const path = require('path');
+
+const root = process.cwd();
+const port = Number(process.argv[2] || process.env.PORT || 5173);
+
+const types = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.ico': 'image/x-icon',
+  '.txt': 'text/plain; charset=utf-8'
+};
+
+function send(res, status, body, type = 'text/plain; charset=utf-8') {
+  res.writeHead(status, { 'Content-Type': type });
+  res.end(body);
+}
+
+function safePath(urlPath) {
+  const decoded = decodeURIComponent(urlPath.split('?')[0]);
+  const clean = path.normalize(decoded).replace(/^(\.\.[/\\])+/, '');
+  const target = path.join(root, clean);
+  if (!target.startsWith(root)) return null;
+  return target;
+}
+
+const server = http.createServer((req, res) => {
+  let target = safePath(req.url === '/' ? '/index.html' : req.url);
+
+  if (!target) {
+    send(res, 403, 'Forbidden');
+    return;
+  }
+
+  if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
+    target = path.join(target, 'index.html');
+  }
+
+  if (!fs.existsSync(target)) {
+    const fallback = path.join(root, 'index.html');
+    if (fs.existsSync(fallback)) {
+      target = fallback;
+    } else {
+      send(res, 404, 'Not found');
+      return;
+    }
+  }
+
+  const type = types[path.extname(target).toLowerCase()] || 'application/octet-stream';
+  res.writeHead(200, { 'Content-Type': type });
+  fs.createReadStream(target).pipe(res);
+});
+
+server.listen(port, '0.0.0.0', () => {
+  console.log(`newbolt-preview serving ${root} on ${port}`);
+});

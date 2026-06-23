@@ -1,0 +1,906 @@
+#!/usr/bin/env node
+
+const crypto = require('crypto');
+const fs = require('fs');
+const http = require('http');
+const net = require('net');
+const path = require('path');
+const { Readable } = require('stream');
+const { spawn, spawnSync } = require('child_process');
+
+const PORT = Number(process.env.SANDBOX_SERVER_PORT || process.env.PORT || 7070);
+const ROOT = process.env.WORKSPACES_ROOT || '/workspace/workspaces';
+const PREVIEW_PORT_BASE = Number(process.env.PREVIEW_PORT_BASE || 6100);
+const CLAUDE_FALLBACK = process.env.CLAUDE_FALLBACK === '1';
+const CLAUDE_PERMISSION_MODE = process.env.CLAUDE_PERMISSION_MODE || 'bypassPermissions';
+const EXEC_USER = process.env.SANDBOX_EXEC_USER || 'agent';
+const SANDBOX_API_TOKEN = process.env.SANDBOX_API_TOKEN || '';
+const RUNTIME_API_VERSION = 'v1';
+const PREVIEW_VERSION = 'hmr-proxy-v2';
+
+const contentTypes = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.ts': 'application/typescript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.ico': 'image/x-icon',
+  '.txt': 'text/plain; charset=utf-8'
+};
+
+fs.mkdirSync(ROOT, { recursive: true });
+
+function json(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body)
+  });
+  res.end(body);
+}
+
+function text(res, status, body) {
+  res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end(body);
+}
+
+function sendNdjson(res, event) {
+  res.write(`${JSON.stringify(event)}\n`);
+}
+
+function notFound(res) {
+  text(res, 404, 'Not found');
+}
+
+function fetchInit(method, headers, body) {
+  return {
+    method,
+    headers,
+    body,
+    ...(body && typeof body.pipe === 'function' ? { duplex: 'half' } : {})
+  };
+}
+
+function unauthorized(res) {
+  json(res, 401, { error: 'Unauthorized sandbox runtime request' });
+}
+
+function isAuthorized(req) {
+  if (!SANDBOX_API_TOKEN) return true;
+  const authorization = String(req.headers.authorization || '');
+  const bearer = authorization.replace(/^Bearer\s+/i, '');
+  return bearer === SANDBOX_API_TOKEN || req.headers['x-sandbox-token'] === SANDBOX_API_TOKEN;
+}
+
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 5 * 1024 * 1024) {
+        reject(new Error('Request body too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        reject(new Error('Invalid JSON body'));
+      }
+    });
+  });
+}
+
+function workspaceId() {
+  return crypto.randomBytes(4).toString('hex');
+}
+
+function workspaceName(id) {
+  return `Workspace ${id}`;
+}
+
+function workspacePayload(id, extra = {}) {
+  return {
+    id,
+    name: workspaceName(id),
+    runtime: 'newbolt-sandbox',
+    version: RUNTIME_API_VERSION,
+    ...extra
+  };
+}
+
+function assertWorkspaceId(id) {
+  if (!/^[a-z0-9-]{6,64}$/.test(id || '')) {
+    throw new Error('Invalid workspace id');
+  }
+}
+
+function workspaceDir(id) {
+  assertWorkspaceId(id);
+  return path.join(ROOT, id);
+}
+
+function ensureWorkspace(id) {
+  const dir = workspaceDir(id);
+  fs.mkdirSync(path.join(dir, '.newbolt'), { recursive: true });
+  if (process.getuid && process.getuid() === 0 && EXEC_USER && EXEC_USER !== 'root') {
+    spawnSync('chown', ['-R', `${EXEC_USER}:${EXEC_USER}`, dir], { stdio: 'ignore' });
+  }
+  return dir;
+}
+
+function workspaceStateDir(id) {
+  return path.join(ensureWorkspace(id), '.newbolt');
+}
+
+function terminalCwdFile(id) {
+  return path.join(workspaceStateDir(id), 'terminal-cwd');
+}
+
+function terminalCwd(id) {
+  const workspace = ensureWorkspace(id);
+  const file = terminalCwdFile(id);
+  if (fs.existsSync(file)) {
+    const saved = fs.readFileSync(file, 'utf8').trim();
+    if (saved && saved.startsWith(workspace) && fs.existsSync(saved)) {
+      return saved;
+    }
+  }
+  return workspace;
+}
+
+function saveTerminalCwd(id, cwd) {
+  const workspace = ensureWorkspace(id);
+  if (!cwd.startsWith(workspace)) {
+    throw new Error('Cannot leave workspace');
+  }
+  fs.writeFileSync(terminalCwdFile(id), cwd);
+}
+
+function resolveTerminalCwd(id, input) {
+  const workspace = ensureWorkspace(id);
+  const current = terminalCwd(id);
+  const targetInput = String(input || '').trim() || workspace;
+  const target = path.resolve(current, targetInput.replace(/^~(?=$|\/)/, workspace));
+  if (!target.startsWith(workspace)) {
+    throw new Error('Cannot leave workspace');
+  }
+  if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
+    throw new Error(`No such directory: ${input}`);
+  }
+  return target;
+}
+
+function relativeTerminalCwd(id) {
+  const workspace = ensureWorkspace(id);
+  const current = terminalCwd(id);
+  const relative = path.relative(workspace, current).replace(/\\/g, '/');
+  return relative ? `/${relative}` : '';
+}
+
+function safeWorkspacePath(input) {
+  const raw = String(input || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  const normalized = path.posix.normalize(raw);
+  if (!normalized || normalized === '.' || normalized.startsWith('../') || normalized === '..') {
+    throw new Error('Invalid file path');
+  }
+  if (normalized.includes('\0')) {
+    throw new Error('Invalid file path');
+  }
+  return normalized;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function run(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const spawnOptions = {
+      cwd: options.cwd,
+      env: options.env || process.env,
+      stdio: ['pipe', 'pipe', 'pipe']
+    };
+
+    if (options.user && process.getuid && process.getuid() === 0) {
+      spawnOptions.uid = userId(options.user);
+      spawnOptions.gid = groupId(options.user);
+    }
+
+    const child = spawn(command, args, spawnOptions);
+
+    const stdout = [];
+    const stderr = [];
+
+    if (options.stdin) {
+      child.stdin.write(options.stdin);
+    }
+    child.stdin.end();
+
+    child.stdout.on('data', (chunk) => stdout.push(chunk));
+    child.stderr.on('data', (chunk) => stderr.push(chunk));
+    child.on('error', reject);
+    child.on('close', (code) => {
+      const out = Buffer.concat(stdout).toString('utf8');
+      const err = Buffer.concat(stderr).toString('utf8');
+      if (code !== 0 && !options.allowFailure) {
+        const error = new Error(err || out || `${command} exited with ${code}`);
+        error.code = code;
+        error.stdout = out;
+        error.stderr = err;
+        reject(error);
+        return;
+      }
+      resolve({ code, stdout: out, stderr: err });
+    });
+  });
+}
+
+function userId(user) {
+  const result = spawnSyncText('id', ['-u', user]);
+  return result ? Number(result) : undefined;
+}
+
+function groupId(user) {
+  const result = spawnSyncText('id', ['-g', user]);
+  return result ? Number(result) : undefined;
+}
+
+function spawnSyncText(command, args) {
+  const result = spawnSync(command, args, { encoding: 'utf8' });
+  if (result.status !== 0) return '';
+  return result.stdout.trim();
+}
+
+function proxyWebSocket(clientSocket, head, targetUrl, requestHeaders = {}) {
+  const port = Number(targetUrl.port || 80);
+  const upstream = net.connect(port, targetUrl.hostname, () => {
+    const headers = {
+      ...requestHeaders,
+      Host: targetUrl.host
+    };
+
+    const lines = [`GET ${targetUrl.pathname}${targetUrl.search} HTTP/1.1`];
+    for (const [key, value] of Object.entries(headers)) {
+      if (value === undefined || value === null) continue;
+      lines.push(`${key}: ${value}`);
+    }
+    lines.push('', '');
+
+    upstream.write(lines.join('\r\n'));
+    if (head?.length) upstream.write(head);
+    clientSocket.pipe(upstream);
+    upstream.pipe(clientSocket);
+  });
+
+  upstream.on('error', () => clientSocket.destroy());
+  clientSocket.on('error', () => upstream.destroy());
+}
+
+function listFiles(id) {
+  const dir = ensureWorkspace(id);
+  const files = [];
+
+  function walk(current, depth = 0) {
+    if (depth > 6 || files.length >= 300) return;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (['.newbolt', 'node_modules', '.git', '.vscode'].includes(entry.name)) continue;
+      const absolute = path.join(current, entry.name);
+      const relative = path.relative(dir, absolute).replace(/\\/g, '/');
+      if (entry.isDirectory()) {
+        walk(absolute, depth + 1);
+      } else if (entry.isFile()) {
+        files.push({ path: relative, name: path.basename(relative) });
+      }
+    }
+  }
+
+  walk(dir);
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  return files;
+}
+
+function detectProjectRoot(id) {
+  const dir = ensureWorkspace(id);
+
+  if (fs.existsSync(path.join(dir, 'package.json')) || fs.existsSync(path.join(dir, 'index.html'))) {
+    return dir;
+  }
+
+  const candidates = [];
+
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith('.') || ['node_modules'].includes(entry.name)) continue;
+    const child = path.join(dir, entry.name);
+    if (fs.existsSync(path.join(child, 'package.json')) || fs.existsSync(path.join(child, 'index.html'))) {
+      candidates.push(child);
+    }
+  }
+
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  return dir;
+}
+
+function readPackageJson(dir) {
+  const file = path.join(dir, 'package.json');
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function isViteProject(dir) {
+  const pkg = readPackageJson(dir);
+  if (!pkg) return false;
+  const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+  return Boolean(deps.vite || /(^|\s)vite(\s|$)/.test(pkg.scripts?.dev || ''));
+}
+
+function findViteConfig(dir) {
+  const names = ['vite.config.ts', 'vite.config.mts', 'vite.config.cts', 'vite.config.js', 'vite.config.mjs', 'vite.config.cjs'];
+  return names.find((name) => fs.existsSync(path.join(dir, name))) || '';
+}
+
+function writeViteProxyConfig(dir, id, port, publicBasePath) {
+  const newboltDir = path.join(dir, '.newbolt');
+  fs.mkdirSync(newboltDir, { recursive: true });
+  const userConfig = findViteConfig(dir);
+  const userImport = userConfig
+    ? `import userConfig from '../${userConfig.replace(/\\/g, '/')}';`
+    : 'const userConfig = {};';
+  const config = `${userImport}
+import { defineConfig, mergeConfig } from 'vite';
+
+const newboltConfig = {
+  server: {
+    host: '0.0.0.0',
+    port: ${port},
+    strictPort: true,
+    proxy: {
+      '/api/soso': {
+        target: process.env.NEWBOLT_QQ_MUSIC_PROXY_TARGET || 'https://c.y.qq.com',
+        changeOrigin: true,
+        secure: true,
+        rewrite: (proxyPath) => proxyPath.replace(/^\\/api/, '')
+      }
+    },
+    hmr: {
+      protocol: 'ws',
+      host: '127.0.0.1',
+      clientPort: 5299,
+      path: '${publicBasePath.replace(/'/g, "\\'")}'
+    }
+  }
+};
+
+export default defineConfig(async (env) => {
+  const resolved = typeof userConfig === 'function' ? await userConfig(env) : userConfig;
+  return mergeConfig(resolved || {}, newboltConfig);
+});
+`;
+  const configPath = path.join(newboltDir, 'vite.config.mjs');
+  fs.writeFileSync(configPath, config, 'utf8');
+  return configPath;
+}
+
+function readWorkspaceFile(id, filePath) {
+  const safe = safeWorkspacePath(filePath);
+  return fs.readFileSync(path.join(ensureWorkspace(id), safe), 'utf8');
+}
+
+function writeWorkspaceFile(id, filePath, content) {
+  const safe = safeWorkspacePath(filePath);
+  const target = path.join(ensureWorkspace(id), safe);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, String(content || ''), 'utf8');
+}
+
+function streamCommand(id, command, res) {
+  ensureWorkspace(id);
+  const trimmed = String(command || '').trim();
+
+  res.writeHead(200, {
+    'Content-Type': 'application/x-ndjson; charset=utf-8',
+    'Cache-Control': 'no-store',
+    Connection: 'keep-alive'
+  });
+
+  sendNdjson(res, { type: 'status', message: '沙箱已就绪' });
+
+  if (trimmed === 'pwd') {
+    sendNdjson(res, { type: 'stdout', data: `${terminalCwd(id)}\n` });
+    sendNdjson(res, { type: 'cwd', cwd: relativeTerminalCwd(id) || '/' });
+    sendNdjson(res, { type: 'done', exitCode: 0 });
+    res.end();
+    return;
+  }
+
+  const cdMatch = trimmed.match(/^cd(?:\s+(.+))?$/);
+  if (cdMatch) {
+    try {
+      const target = resolveTerminalCwd(id, cdMatch[1] || '');
+      saveTerminalCwd(id, target);
+      sendNdjson(res, { type: 'cwd', cwd: relativeTerminalCwd(id) || '/' });
+      sendNdjson(res, { type: 'done', exitCode: 0 });
+    } catch (error) {
+      sendNdjson(res, { type: 'stderr', data: `${error.message}\n` });
+      sendNdjson(res, { type: 'done', exitCode: 1 });
+    }
+    res.end();
+    return;
+  }
+
+  const dir = terminalCwd(id);
+
+  const spawnOptions = {
+    cwd: dir,
+    env: process.env,
+    stdio: ['pipe', 'pipe', 'pipe']
+  };
+
+  if (process.getuid && process.getuid() === 0 && EXEC_USER && EXEC_USER !== 'root') {
+    spawnOptions.uid = userId(EXEC_USER);
+    spawnOptions.gid = groupId(EXEC_USER);
+  }
+
+  const child = spawn('sh', ['-lc', command], spawnOptions);
+
+  child.stdin.end();
+  child.stdout.on('data', (chunk) => sendNdjson(res, { type: 'stdout', data: chunk.toString('utf8') }));
+  child.stderr.on('data', (chunk) => sendNdjson(res, { type: 'stderr', data: chunk.toString('utf8') }));
+  child.on('error', (error) => {
+    sendNdjson(res, { type: 'error', message: error.message });
+    res.end();
+  });
+  child.on('close', (code) => {
+    sendNdjson(res, { type: 'cwd', cwd: relativeTerminalCwd(id) || '/' });
+    sendNdjson(res, { type: 'done', exitCode: code });
+    res.end();
+  });
+}
+
+function chatCommand() {
+  return [
+    'set +e',
+    'prompt_file=".newbolt/last-prompt.txt"',
+    'session_file=".newbolt/claude-session-id"',
+    'tmp_output=".newbolt/claude-last-output.ndjson"',
+    'status_file=".newbolt/claude-last-status"',
+    'fallback="${CLAUDE_FALLBACK:-0}"',
+    'permission_mode="${CLAUDE_PERMISSION_MODE:-bypassPermissions}"',
+    'model="${CLAUDE_MODEL:-${ANTHROPIC_MODEL:-}}"',
+    'model_args=""',
+    'if [ -n "$model" ]; then model_args="--model $model"; fi',
+    'run_claude() {',
+    '  if [ -s "$session_file" ]; then',
+    '    claude -p "$(cat "$prompt_file")" --resume "$(cat "$session_file")" $model_args --output-format stream-json --verbose --permission-mode "$permission_mode"',
+    '  else',
+    '    claude -p "$(cat "$prompt_file")" $model_args --output-format stream-json --verbose --permission-mode "$permission_mode"',
+    '  fi',
+    '}',
+    'extract_session() {',
+    '  node -e "const fs=require(\'fs\'); const input=fs.readFileSync(0,\'utf8\').trim().split(/\\n+/); for (const line of input) { try { const item=JSON.parse(line); const id=item.session_id || item.sessionId || (item.message && (item.message.session_id || item.message.sessionId)); if (id) { console.log(id); process.exit(0); } } catch {} } process.exit(1);"',
+    '}',
+    'if ! command -v claude >/dev/null 2>&1; then',
+    '  echo "[newbolt] 未找到 claude 命令，请在沙箱镜像中安装 Claude Code。" >&2',
+    '  if [ "$fallback" = "1" ]; then node /usr/local/bin/newbolt-agent < "$prompt_file"; exit $?; fi',
+    '  exit 127',
+    'fi',
+    'rm -f "$tmp_output" "$status_file"',
+    '( run_claude; echo "$?" > "$status_file" ) 2>&1 | tee "$tmp_output" | node /usr/local/bin/newbolt-claude-presenter',
+    'claude_code="$(cat "$status_file" 2>/dev/null || echo 1)"',
+    'case "$claude_code" in ""|*[!0-9]*) claude_code=1;; esac',
+    'session_id="$(extract_session < "$tmp_output" || true)"',
+    'if [ -n "$session_id" ]; then printf "%s" "$session_id" > "$session_file"; fi',
+    'if [ "$claude_code" -eq 0 ]; then',
+    '  exit 0',
+    'fi',
+    'echo "[newbolt] Claude Code 执行失败，退出码 $claude_code。" >&2',
+    'if [ "$fallback" = "1" ]; then',
+    '  echo "[newbolt] CLAUDE_FALLBACK=1，切换到本地兜底 Agent。" >&2',
+    '  node /usr/local/bin/newbolt-agent < "$prompt_file"',
+    '  exit $?',
+    'fi',
+    'exit "$claude_code"'
+  ].join('\n');
+}
+
+function previewPort(id) {
+  const value = crypto.createHash('sha1').update(id).digest().readUInt16BE(0);
+  return PREVIEW_PORT_BASE + (value % 1000);
+}
+
+function checkPort(port) {
+  return run('node', ['-e', `require('net').connect(${port}, '127.0.0.1').on('connect', function(){process.exit(0)}).on('error', function(){process.exit(1)})`], {
+    allowFailure: true
+  });
+}
+
+function normalizePreviewBasePath(value, fallback) {
+  const raw = String(value || fallback || '/').trim();
+  const withLeadingSlash = raw.startsWith('/') ? raw : `/${raw}`;
+  return withLeadingSlash.endsWith('/') ? withLeadingSlash : `${withLeadingSlash}/`;
+}
+
+function previewBaseFile(id) {
+  return path.join(ensureWorkspace(id), '.newbolt', 'preview-public-base');
+}
+
+function storedPreviewBasePath(id, fallback) {
+  const file = previewBaseFile(id);
+  if (!fs.existsSync(file)) return normalizePreviewBasePath(fallback, fallback);
+  return normalizePreviewBasePath(fs.readFileSync(file, 'utf8'), fallback);
+}
+
+async function startPreview(id, publicBasePath = `/api/workspaces/${id}/preview/`) {
+  const workspace = ensureWorkspace(id);
+  const previewBasePath = normalizePreviewBasePath(publicBasePath, `/api/workspaces/${id}/preview/`);
+  const dir = detectProjectRoot(id);
+  const port = previewPort(id);
+  const previewRootFile = path.join(workspace, '.newbolt', 'preview-root');
+  const previewVersionFile = path.join(workspace, '.newbolt', 'preview-version');
+  const previewPublicBaseFile = previewBaseFile(id);
+  const previousRoot = fs.existsSync(previewRootFile) ? fs.readFileSync(previewRootFile, 'utf8') : '';
+  const previousVersion = fs.existsSync(previewVersionFile) ? fs.readFileSync(previewVersionFile, 'utf8') : '';
+  const previousPublicBase = fs.existsSync(previewPublicBaseFile) ? fs.readFileSync(previewPublicBaseFile, 'utf8') : '';
+  const alive = await checkPort(port);
+  if (alive.code === 0 && previousRoot === dir && previousVersion === PREVIEW_VERSION && previousPublicBase === previewBasePath) {
+    return previewInfo(id, port, dir, previewBasePath);
+  }
+
+  if (alive.code === 0) {
+    await run('sh', ['-lc', `fuser -k ${port}/tcp >/dev/null 2>&1 || true`], { allowFailure: true });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+
+  const hasDevScript = fs.existsSync(path.join(dir, 'package.json')) && await run('node', [
+    '-e',
+    "const p=require('./package.json'); process.exit(p.scripts&&p.scripts.dev?0:1)"
+  ], { cwd: dir, user: EXEC_USER, allowFailure: true });
+
+  const useDev = hasDevScript && hasDevScript.code === 0;
+  const logFile = path.join(dir, '.newbolt', 'preview.log');
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+
+  if (useDev && !fs.existsSync(path.join(dir, 'node_modules'))) {
+    await run('npm', ['install'], { cwd: dir, user: EXEC_USER, allowFailure: true });
+  }
+
+  let command = `node /usr/local/bin/newbolt-preview ${port}`;
+  if (useDev) {
+    if (isViteProject(dir)) {
+      const configPath = writeViteProxyConfig(dir, id, port, previewBasePath);
+      command = `npx vite --config ${shellQuote(configPath)}`;
+    } else {
+      command = `npm run dev -- --host 0.0.0.0 --port ${port}`;
+    }
+  }
+
+  const out = fs.openSync(logFile, 'a');
+  const spawnOptions = {
+    cwd: dir,
+    env: process.env,
+    detached: true,
+    stdio: ['ignore', out, out]
+  };
+
+  if (process.getuid && process.getuid() === 0 && EXEC_USER && EXEC_USER !== 'root') {
+    spawnOptions.uid = userId(EXEC_USER);
+    spawnOptions.gid = groupId(EXEC_USER);
+  }
+
+  const child = spawn('sh', ['-lc', command], spawnOptions);
+  child.unref();
+  fs.mkdirSync(path.dirname(previewRootFile), { recursive: true });
+  fs.writeFileSync(path.join(workspace, '.newbolt', 'preview.pid'), String(child.pid));
+  fs.writeFileSync(previewRootFile, dir);
+  fs.writeFileSync(previewVersionFile, PREVIEW_VERSION);
+  fs.writeFileSync(previewPublicBaseFile, previewBasePath);
+
+  for (let index = 0; index < 40; index += 1) {
+    const ready = await checkPort(port);
+    if (ready.code === 0) return previewInfo(id, port, dir, previewBasePath);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  throw new Error(`Preview failed to start. ${fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').slice(-4000) : ''}`);
+}
+
+function previewInfo(id, port, dir, publicBasePath = `/api/workspaces/${id}/preview/`) {
+  const url = normalizePreviewBasePath(publicBasePath, `/api/workspaces/${id}/preview/`);
+  return {
+    port,
+    url,
+    internalUrl: `http://127.0.0.1:${port}/`,
+    projectRoot: path.relative(ensureWorkspace(id), dir).replace(/\\/g, '/') || '.'
+  };
+}
+
+function previewHeaders(headers) {
+  const result = Object.fromEntries(headers.entries());
+  delete result['content-length'];
+  delete result['content-encoding'];
+  delete result['transfer-encoding'];
+  return result;
+}
+
+function shouldRewritePreviewResponse(contentType) {
+  return /text\/html|text\/css|javascript|typescript/.test(contentType || '');
+}
+
+function rewritePreviewBody(body, basePath) {
+  const base = basePath.endsWith('/') ? basePath : `${basePath}/`;
+
+  return body
+    .replace(/((?:src|href|action)\s*=\s*["'])\/(?!\/|api\/workspaces\/)/gi, (_match, prefix) => `${prefix}${base}`)
+    .replace(/(url\(\s*["']?)\/(?!\/|api\/workspaces\/)/gi, (_match, prefix) => `${prefix}${base}`)
+    .replace(/(\bfrom\s*["'])\/(?!\/|api\/workspaces\/)/g, (_match, prefix) => `${prefix}${base}`)
+    .replace(/(\bimport\s*["'])\/(?!\/|api\/workspaces\/)/g, (_match, prefix) => `${prefix}${base}`)
+    .replace(/(\bimport\s*\(\s*["'])\/(?!\/|api\/workspaces\/)/g, (_match, prefix) => `${prefix}${base}`);
+}
+
+async function proxyPreview(req, res, id, restPath, basePath) {
+  const { port } = await startPreview(id);
+  const requestUrl = new URL(req.url, `http://${req.headers.host}`);
+  const targetPath = restPath || '/';
+  const target = new URL(targetPath + requestUrl.search, `http://127.0.0.1:${port}`);
+
+  const headers = { ...req.headers };
+  headers.host = `127.0.0.1:${port}`;
+
+  const upstream = await fetch(target, fetchInit(
+    req.method,
+    headers,
+    req.method === 'GET' || req.method === 'HEAD' ? undefined : req
+  ));
+
+  const outHeaders = previewHeaders(upstream.headers);
+  const contentType = outHeaders['content-type'] || '';
+
+  if (shouldRewritePreviewResponse(contentType)) {
+    const body = rewritePreviewBody(await upstream.text(), basePath);
+    res.writeHead(upstream.status, outHeaders);
+    res.end(body);
+    return;
+  }
+
+  res.writeHead(upstream.status, Object.fromEntries(upstream.headers.entries()));
+  if (upstream.body) {
+    Readable.fromWeb(upstream.body).pipe(res);
+  } else {
+    res.end();
+  }
+}
+
+async function handlePreviewWebSocket(req, socket, head) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const match = url.pathname.match(/^\/(?:v1\/)?workspaces\/([a-z0-9-]{6,64})\/preview(\/.*)?$/);
+  if (!match) return false;
+
+  const id = match[1];
+  const publicBasePath = storedPreviewBasePath(id, url.pathname.startsWith('/v1/') ? `/v1/workspaces/${id}/preview/` : `/api/workspaces/${id}/preview/`);
+  const { port } = await startPreview(id, publicBasePath);
+  const target = new URL(`${publicBasePath}${url.search}`, `http://127.0.0.1:${port}`);
+  proxyWebSocket(socket, head, target, req.headers);
+  return true;
+}
+
+async function deployWorkspace(id) {
+  const dir = detectProjectRoot(id);
+  const deployId = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+  const dest = path.join(dir, '.newbolt', 'deployments', deployId, 'public');
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(dest, { recursive: true });
+
+  if (fs.existsSync(path.join(dir, 'package.json'))) {
+    const canBuild = await run('node', [
+      '-e',
+      "const p=require('./package.json'); process.exit(p.scripts&&p.scripts.build?0:1)"
+    ], { cwd: dir, user: EXEC_USER, allowFailure: true });
+    if (canBuild.code === 0) {
+      await run('npm', ['run', 'build'], { cwd: dir, user: EXEC_USER, allowFailure: true });
+    }
+  }
+
+  const source = fs.existsSync(path.join(dir, 'dist')) ? path.join(dir, 'dist') : dir;
+  copyTree(source, dest, new Set(['.newbolt', 'node_modules', '.git']));
+  return deployId;
+}
+
+function copyTree(source, dest, ignored) {
+  fs.mkdirSync(dest, { recursive: true });
+  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+    if (ignored.has(entry.name)) continue;
+    const from = path.join(source, entry.name);
+    const to = path.join(dest, entry.name);
+    if (entry.isDirectory()) {
+      copyTree(from, to, ignored);
+    } else if (entry.isFile()) {
+      fs.copyFileSync(from, to);
+    }
+  }
+}
+
+function serveDeployment(req, res, id, deployId, restPath) {
+  if (!/^[0-9]{14}$/.test(deployId)) {
+    text(res, 400, 'Invalid deployment id');
+    return;
+  }
+
+  const current = new URL(req.url, `http://${req.headers.host}`);
+  let rel = restPath || '/index.html';
+  if (rel === '/') rel = '/index.html';
+  const safe = safeWorkspacePath(rel);
+  const root = path.join(ensureWorkspace(id), '.newbolt', 'deployments', deployId, 'public');
+  let target = path.join(root, safe);
+
+  if (!target.startsWith(root) || !fs.existsSync(target)) {
+    target = path.join(root, 'index.html');
+  }
+
+  if (!fs.existsSync(target)) {
+    notFound(res);
+    return;
+  }
+
+  const type = contentTypes[path.extname(target).toLowerCase()] || 'application/octet-stream';
+  res.writeHead(200, { 'Content-Type': type });
+  fs.createReadStream(target).pipe(res);
+}
+
+async function handleApi(req, res, url) {
+  const parts = url.pathname.split('/').filter(Boolean);
+  const versioned = parts[0] === RUNTIME_API_VERSION;
+  const apiParts = versioned ? parts.slice(1) : parts;
+
+  if ((versioned && apiParts[0] === 'health') || url.pathname === '/health') {
+    json(res, 200, {
+      ok: true,
+      runtime: 'newbolt-sandbox',
+      version: RUNTIME_API_VERSION,
+      root: ROOT,
+      auth: SANDBOX_API_TOKEN ? 'token' : 'none'
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && versioned && apiParts[0] === 'capabilities') {
+    json(res, 200, {
+      runtime: 'newbolt-sandbox',
+      version: RUNTIME_API_VERSION,
+      transports: ['http', 'ndjson', 'websocket-preview'],
+      workspace: ['create', 'ensure', 'files.list', 'files.read', 'files.write'],
+      execution: ['chat', 'command'],
+      preview: ['start', 'http-proxy', 'websocket-proxy'],
+      deploy: ['snapshot']
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && apiParts.length === 1 && apiParts[0] === 'workspaces') {
+    const id = workspaceId();
+    ensureWorkspace(id);
+    json(res, 201, workspacePayload(id));
+    return;
+  }
+
+  if (apiParts[0] !== 'workspaces' || !apiParts[1]) {
+    notFound(res);
+    return;
+  }
+
+  const id = apiParts[1];
+  assertWorkspaceId(id);
+
+  if (req.method === 'POST' && apiParts.length === 2) {
+    ensureWorkspace(id);
+    json(res, 200, workspacePayload(id));
+    return;
+  }
+
+  if (req.method === 'GET' && apiParts[2] === 'files') {
+    json(res, 200, { files: listFiles(id) });
+    return;
+  }
+
+  if (req.method === 'GET' && apiParts[2] === 'file') {
+    const file = url.searchParams.get('path');
+    json(res, 200, { path: file, content: readWorkspaceFile(id, file) });
+    return;
+  }
+
+  if (req.method === 'PUT' && apiParts[2] === 'file') {
+    const body = await parseBody(req);
+    writeWorkspaceFile(id, body.path, body.content);
+    json(res, 200, { ok: true });
+    return;
+  }
+
+  if (req.method === 'POST' && apiParts[2] === 'commands') {
+    const body = await parseBody(req);
+    streamCommand(id, String(body.command || 'pwd'), res);
+    return;
+  }
+
+  if (req.method === 'POST' && apiParts[2] === 'chat') {
+    const body = await parseBody(req);
+    writeWorkspaceFile(id, '.newbolt/last-prompt.txt', body.message || '');
+    streamCommand(id, chatCommand(), res);
+    return;
+  }
+
+  if (req.method === 'POST' && apiParts[2] === 'preview' && apiParts[3] === 'start') {
+    const body = await parseBody(req);
+    const fallbackBasePath = versioned ? `/v1/workspaces/${id}/preview/` : `/api/workspaces/${id}/preview/`;
+    json(res, 200, await startPreview(id, body.publicBasePath || fallbackBasePath));
+    return;
+  }
+
+  if (apiParts[2] === 'preview') {
+    const rest = `/${apiParts.slice(3).join('/')}` || '/';
+    const fallbackBasePath = versioned ? `/v1/workspaces/${id}/preview/` : `/api/workspaces/${id}/preview/`;
+    await proxyPreview(req, res, id, rest, storedPreviewBasePath(id, fallbackBasePath).replace(/\/$/, ''));
+    return;
+  }
+
+  if (req.method === 'POST' && apiParts[2] === 'deploy') {
+    const deployId = await deployWorkspace(id);
+    json(res, 200, {
+      deployId,
+      url: `${versioned ? '/v1' : '/api'}/workspaces/${id}/deployments/${deployId}/`
+    });
+    return;
+  }
+
+  if (apiParts[2] === 'deployments' && apiParts[3]) {
+    const rest = `/${apiParts.slice(4).join('/')}` || '/';
+    serveDeployment(req, res, id, apiParts[3], rest);
+    return;
+  }
+
+  notFound(res);
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    if (!isAuthorized(req)) {
+      unauthorized(res);
+      return;
+    }
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    await handleApi(req, res, url);
+  } catch (error) {
+    json(res, 500, { error: error.message });
+  }
+});
+
+server.on('upgrade', (req, socket, head) => {
+  if (!isAuthorized(req)) {
+    socket.destroy();
+    return;
+  }
+  handlePreviewWebSocket(req, socket, head).then((handled) => {
+    if (!handled) socket.destroy();
+  }).catch(() => socket.destroy());
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`NewBolt sandbox runtime listening on http://0.0.0.0:${PORT}`);
+});

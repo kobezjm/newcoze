@@ -1,0 +1,13 @@
+{
+  "name": "newbolt-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloud sandbox AI coding MVP with a browser workbench and Docker-managed agent sandboxes.",
+  "scripts": {
+    "start": "node server/index.js",
+    "check": "node --check server/index.js && node --check sandbox/bin/newbolt-agent && node --check sandbox/bin/newbolt-preview"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

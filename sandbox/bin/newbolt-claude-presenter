@@ -1,0 +1,161 @@
+#!/usr/bin/env node
+
+const readline = require('readline');
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  crlfDelay: Infinity
+});
+
+let announced = false;
+let wroteAssistantText = false;
+
+function emit(event) {
+  process.stdout.write(`${JSON.stringify(event)}\n`);
+}
+
+function write(text = '') {
+  if (text) emit({ kind: 'text', text });
+}
+
+function shortJson(value) {
+  if (value === undefined || value === null) return '';
+  try {
+    const json = JSON.stringify(value, null, 2);
+    return json.length > 1200 ? `${json.slice(0, 1200)}...` : json;
+  } catch {
+    return String(value);
+  }
+}
+
+function toolTitle(name) {
+  if (name === 'Bash') return '执行命令';
+  if (name === 'Read') return '读取文件';
+  if (name === 'Write' || name === 'Edit' || name === 'NotebookEdit') return '文件操作';
+  if (name === 'Glob' || name === 'Grep') return '检索代码';
+  if (name === 'AskUserQuestion') return '等待确认';
+  if (name === 'EnterPlanMode') return '进入规划';
+  if (name === 'ExitPlanMode') return '提交计划';
+  return '工具调用';
+}
+
+function textFromContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+
+  const textParts = [];
+
+  for (const item of content) {
+    if (!item) continue;
+
+    if (item.type === 'text') {
+      textParts.push(item.text || '');
+      continue;
+    }
+
+    if (item.type === 'tool_use') {
+      emit({
+        kind: item.name === 'Bash' ? 'command' : 'tool',
+        title: toolTitle(item.name),
+        name: item.name || 'tool',
+        input: item.input || {}
+      });
+      continue;
+    }
+
+    if (item.type === 'tool_result') {
+      const body = typeof item.content === 'string' ? item.content : shortJson(item.content);
+      if (body) emit({ kind: 'tool_result', title: '工具结果', text: body });
+    }
+  }
+
+  return textParts.join('');
+}
+
+function handleSystem(item) {
+  if (item.subtype === 'init') {
+    if (announced) return;
+    announced = true;
+    emit({
+      kind: 'system',
+      title: 'Claude Code',
+      text: `已连接，会话 ${item.session_id || '-'}，模型 ${item.model || '-'}。`
+    });
+    return;
+  }
+
+  if (item.subtype === 'api_retry') {
+    emit({
+      kind: 'system',
+      title: 'API 重试',
+      text: `第 ${item.attempt}/${item.max_retries} 次重试，状态 ${item.error_status || item.error || '-'}。`
+    });
+    if (item.error_status === 401 && item.attempt === 1) {
+      emit({
+        kind: 'error',
+        title: '鉴权失败',
+        text: '401 表示百炼鉴权失败：请检查 ANTHROPIC_AUTH_TOKEN 是否为真实 API Key，并确认 Key 类型与 ANTHROPIC_BASE_URL 对应。'
+      });
+    }
+    return;
+  }
+
+  if (item.subtype === 'error' || item.error) {
+    emit({ kind: 'error', title: 'Claude Code', text: item.error || item.message || shortJson(item) });
+  }
+}
+
+function handleResult(item) {
+  if (item.result && !wroteAssistantText) write(item.result);
+
+  const usage = item.usage || item.message?.usage;
+  if (usage) {
+    const input = usage.input_tokens ?? usage.cache_read_input_tokens ?? '-';
+    const output = usage.output_tokens ?? '-';
+    emit({ kind: 'system', title: '本轮完成', text: `输入 ${input} tokens，输出 ${output} tokens。` });
+  } else {
+    emit({ kind: 'system', title: '本轮完成', text: '执行已结束。' });
+  }
+}
+
+function handleItem(item) {
+  if (item.type === 'system') {
+    handleSystem(item);
+    return;
+  }
+
+  if (item.type === 'assistant') {
+    const text = textFromContent(item.message?.content);
+    if (text) {
+      wroteAssistantText = true;
+      write(text);
+    }
+    return;
+  }
+
+  if (item.type === 'user') {
+    const text = textFromContent(item.message?.content);
+    if (text) emit({ kind: 'tool_result', title: '工具返回', text });
+    return;
+  }
+
+  if (item.type === 'result') {
+    handleResult(item);
+    return;
+  }
+
+  if (item.type === 'error') {
+    emit({ kind: 'error', title: 'Claude Code', text: item.message || item.error || shortJson(item) });
+  }
+}
+
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  try {
+    handleItem(JSON.parse(trimmed));
+  } catch {
+    emit({ kind: 'raw', text: line });
+  }
+});

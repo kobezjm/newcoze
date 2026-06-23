@@ -1,0 +1,52 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GATEWAY_BASE: boltdiy-gateway-server:fixed-20260607-public
+    image: newbolt-gateway:mvp
+    env_file:
+      - .env
+    ports:
+      - "5299:5299"
+    environment:
+      PORT: "5299"
+      SANDBOX_BASE_URL: "http://sandbox:7070"
+      SANDBOX_API_TOKEN: "${SANDBOX_API_TOKEN:-}"
+    volumes:
+      - newbolt_gateway_data:/app/data
+    networks:
+      - newbolt_mvp
+    depends_on:
+      - sandbox
+
+  sandbox:
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_BASE: boltdiy-sandbox-server:fixed-20260607-public
+    image: newbolt-sandbox:mvp
+    user: "0:0"
+    env_file:
+      - .env
+    environment:
+      SANDBOX_SERVER_PORT: "7070"
+      WORKSPACES_ROOT: "/workspace/workspaces"
+      CLAUDE_FALLBACK: "${CLAUDE_FALLBACK:-0}"
+      CLAUDE_PERMISSION_MODE: "${CLAUDE_PERMISSION_MODE:-bypassPermissions}"
+      SANDBOX_EXEC_USER: "${SANDBOX_EXEC_USER:-agent}"
+      SANDBOX_API_TOKEN: "${SANDBOX_API_TOKEN:-}"
+    volumes:
+      - newbolt_sandbox_workspaces:/workspace/workspaces
+    networks:
+      - newbolt_mvp
+
+volumes:
+  newbolt_gateway_data:
+  newbolt_sandbox_workspaces:
+
+networks:
+  newbolt_mvp:
+    name: newbolt_mvp

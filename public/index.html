@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NewBolt AI 编程工作台</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="nav">
+      <div class="brand">
+        <span class="brand-mark">N</span>
+        <strong>NewBolt</strong>
+      </div>
+      <button id="newWorkspace" class="nav-action">新建会话</button>
+      <div class="workspace-meta">
+        <span>当前工作区</span>
+        <strong id="workspaceId">启动中...</strong>
+      </div>
+    </aside>
+
+    <section class="chat-panel">
+      <header class="panel-header">
+        <div>
+          <span class="eyebrow">智能体</span>
+          <h1>AI 编程会话</h1>
+        </div>
+        <span id="status" class="status">启动中</span>
+      </header>
+      <div id="messages" class="messages"></div>
+      <form id="chatForm" class="chat-form">
+        <textarea id="prompt" rows="3" placeholder="告诉 Claude Code 你要开发或修改什么..."></textarea>
+        <button type="submit">发送</button>
+      </form>
+    </section>
+
+    <section class="workbench">
+      <header class="topbar">
+        <div class="tabs">
+          <button class="tab active" data-tab="files">文件</button>
+          <button class="tab" data-tab="preview">预览</button>
+          <button class="tab" data-tab="terminal">终端</button>
+        </div>
+        <div class="actions">
+          <button id="refreshFiles">刷新</button>
+          <button id="startPreview">预览</button>
+          <button id="deploy">部署</button>
+        </div>
+      </header>
+
+      <div class="workspace-grid tab-view active" data-view="files">
+        <aside class="file-list" id="fileList"></aside>
+        <main class="editor">
+          <div class="editor-header">
+            <span id="activePath">未选择文件</span>
+            <button id="saveFile">保存</button>
+          </div>
+          <textarea id="editor" spellcheck="false"></textarea>
+        </main>
+      </div>
+
+      <div class="preview tab-view" data-view="preview">
+        <div class="preview-toolbar">
+          <span>运行地址</span>
+          <a id="previewUrl" href="#" target="_blank" rel="noreferrer">未启动</a>
+        </div>
+        <iframe id="previewFrame" title="预览"></iframe>
+      </div>
+
+      <div class="terminal tab-view" data-view="terminal">
+        <div id="terminalSurface" class="terminal-surface" tabindex="0" role="textbox" aria-label="沙箱终端">
+          <pre id="terminalOutput"></pre>
+          <div class="terminal-line">
+            <span class="terminal-prompt">$</span>
+            <span id="terminalEntry" class="terminal-entry"></span>
+            <span class="terminal-caret"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
