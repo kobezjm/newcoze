@@ -2,6 +2,12 @@
 
 NewCoze MVP 是一个基于浏览器的 AI 编程工作台示例项目。它通过 Gateway 提供前端页面和 API，通过 Sandbox Runtime 提供隔离的工作区、文件读写、终端执行、预览代理、部署快照和 Claude Code/Qwen Agent 调用能力。
 
+## 界面预览
+
+![NewCoze 工作台截图](docs/screenshot.png)
+
+> 请将截图文件保存为 `docs/screenshot.png`，README 会自动显示该图片。
+
 ## 功能特性
 
 - 浏览器工作台：聊天、文件列表、代码编辑、预览、终端和部署入口。
